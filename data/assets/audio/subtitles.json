@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "assets": {
+    "exam_end.mp3": {
+      "sha256": "d5af7c82a266ea2a39170ea4050fa5a5611cb45116dc043f85feb47dd2fce292",
+      "captions": [
+        {
+          "chinese": "考试时间结束。",
+          "english": "Time is up."
+        },
+        {
+          "chinese": "请监考老师收卷。",
+          "english": "Invigilators, please collect the papers."
+        }
+      ]
+    },
+    "closing.mp3": {
+      "sha256": "3aa90d9d5256ed6f6efc9535c78bbfbdaf7b55c21ff4e6d251bfa6dc512a9590",
+      "captions": [
+        {
+          "chinese": "同学们，翻译结束。",
+          "english": "Students, the translation is over."
+        },
+        {
+          "chinese": "想过四六级，点赞加关注。",
+          "english": "Want to pass CET-4 or CET-6? Like and follow."
+        }
+      ]
+    }
+  }
+}

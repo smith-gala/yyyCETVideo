@@ -1,1 +1,48 @@
+*.py[cod]
+__pycache__/
+.pytest_cache/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+my_video/
+
+# IDE
+.vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data directories
+data/cache/*
+# 旧版本的本地 PDF 目录继续忽略，避免已有文件进入版本控制。
+data/downloads/*
+data/pdfs/*
+data/output/*
+data/temp/*
+!data/cache/.gitkeep
+!data/downloads/.gitkeep
+!data/pdfs/.gitkeep
+!data/output/.gitkeep
+!data/temp/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+*.log
+
+# Environment variables
+.env
+.env.local
+
+# Streamlit
+.streamlit/
+
+# MoviePy
+__temp__.mp4

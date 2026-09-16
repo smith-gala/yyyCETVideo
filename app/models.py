@@ -23,6 +23,12 @@ class SubtitleSegment(BaseModel):
     chinese: str = Field("", description="中文字幕")
 
 
+class TranslationUnit(BaseModel):
+    """持久化的中英语义单元，不包含音频时间轴。"""
+    english: str = Field("", description="完整英文语义单元")
+    chinese: str = Field("", description="对应中文语义单元")
+
+
 class ExamMetadata(BaseModel):
     """渲染层唯一使用的考试来源与展示元数据。"""
 
@@ -108,7 +114,9 @@ class ExamPaper(BaseModel):
     topic_keyword: Optional[str] = Field(None, description="背景素材搜索关键词（兼容旧缓存）")
     publish_topic: Optional[str] = Field(None, description="短视频发布文案主题，如“袁隆平--杂交水稻”")
     key_expressions: Optional[List[KeyExpression]] = Field(default_factory=list, description="重点表达列表")
+    translation_units: Optional[List[TranslationUnit]] = Field(default_factory=list, description="正文中英语义单元")
     subtitle_segments: Optional[List[SubtitleSegment]] = Field(default_factory=list, description="正文中英字幕时间轴")
+    subtitle_pipeline_version: int = Field(1, description="正文语音与字幕管线版本")
     pdf_path: Optional[str] = Field(None, description="PDF文件路径")
     created_at: datetime = Field(default_factory=datetime.now)
 

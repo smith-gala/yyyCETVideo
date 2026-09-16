@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import re
 import subprocess
+import os
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from dotenv import load_dotenv
 
 from moviepy.config import FFMPEG_BINARY
 
@@ -12,6 +16,7 @@ from app.models import SubtitleSegment
 
 
 SILENCE_RE = re.compile(r"silence_(start|end):\s*([0-9.]+)")
+_ENGLISH_WHISPER_MODELS: dict[tuple[str, str, str], object] = {}
 
 
 def detect_silences(
@@ -53,6 +58,92 @@ def voiced_bounds(audio_path: str | Path, duration: float, padding: float = 0.06
     if end - start < 0.2:
         return 0.0, float(duration)
     return max(0.0, start), min(float(duration), end)
+
+
+def english_word_timestamps(
+    audio_path: str | Path,
+    expected_text: str = "",
+) -> list[tuple[float, float, str]]:
+    """懒加载 Whisper，返回英文词级时间戳；调用方负责提供安全兜底。"""
+    load_dotenv(override=True)
+    model_name = os.getenv("WHISPER_MODEL", "small").strip() or "small"
+    device = os.getenv("WHISPER_DEVICE", "auto").strip() or "auto"
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8"
+    cache_key = (model_name, device, compute_type)
+    model = _ENGLISH_WHISPER_MODELS.get(cache_key)
+    if model is None:
+        from faster_whisper import WhisperModel
+
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        _ENGLISH_WHISPER_MODELS[cache_key] = model
+
+    raw_segments, _ = model.transcribe(
+        str(audio_path),
+        language="en",
+        beam_size=1,
+        vad_filter=True,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        initial_prompt=expected_text or None,
+    )
+    words: list[tuple[float, float, str]] = []
+    for segment in raw_segments:
+        for word in getattr(segment, "words", None) or []:
+            text = str(getattr(word, "word", "")).strip()
+            start = getattr(word, "start", None)
+            end = getattr(word, "end", None)
+            if text and start is not None and end is not None and float(end) > float(start):
+                words.append((max(0.0, float(start)), float(end), text))
+    return words
+
+
+def cue_boundaries_from_word_timestamps(
+    cue_texts: Sequence[str],
+    words: Sequence[tuple[float, float, str]],
+    duration: float,
+) -> list[float]:
+    """把已知字幕文本边界映射到 Whisper 词时间戳；识别差异过大时返回空列表。"""
+    if len(cue_texts) <= 1 or len(words) < 2:
+        return []
+    expected_parts = [_alignment_text(text) for text in cue_texts]
+    expected = "".join(expected_parts)
+    recognized_parts = [_alignment_text(word[2]) for word in words]
+    recognized = "".join(recognized_parts)
+    if not expected or not recognized or SequenceMatcher(None, expected, recognized).ratio() < 0.55:
+        return []
+
+    expected_total = len(expected)
+    recognized_total = max(1, len(recognized))
+    recognized_cumulative = []
+    cursor = 0
+    for value in recognized_parts:
+        cursor += len(value)
+        recognized_cumulative.append(cursor)
+
+    boundaries: list[float] = []
+    expected_cursor = 0
+    previous_word_index = -1
+    for part in expected_parts[:-1]:
+        expected_cursor += len(part)
+        target_ratio = expected_cursor / expected_total
+        valid_indices = range(previous_word_index + 1, len(words) - 1)
+        try:
+            word_index = min(
+                valid_indices,
+                key=lambda index: abs(recognized_cumulative[index] / recognized_total - target_ratio),
+            )
+        except ValueError:
+            return []
+        boundary = (float(words[word_index][1]) + float(words[word_index + 1][0])) / 2
+        if boundaries and boundary <= boundaries[-1] + 0.05:
+            return []
+        boundaries.append(max(0.05, min(float(duration) - 0.05, boundary)))
+        previous_word_index = word_index
+    return boundaries
+
+
+def _alignment_text(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z]", "", str(value)).lower()
 
 
 def align_captions_to_audio(

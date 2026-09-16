@@ -2,7 +2,7 @@ import hashlib
 import json
 
 from app.services.audio_alignment import _select_boundaries, align_captions_to_audio
-from app.config import OPENING_SECTION_SET_GAP_SECONDS, OPENING_SENTENCE_GAP_SECONDS
+from app.config import OPENING_SENTENCE_GAP_SECONDS
 from app.models import ExamMetadata, ExamPaper, SubtitleSegment
 from app.services.audio_service import (
     FishAudioService,
@@ -60,7 +60,7 @@ def test_opening_announcement_uses_real_exam_year_month_and_level():
     )
 
 
-def test_first_set_opening_does_not_generate_set_audio(tmp_path, monkeypatch):
+def test_opening_does_not_generate_set_audio(tmp_path, monkeypatch):
     import app.services.audio_service as audio_module
 
     monkeypatch.setattr(audio_module, "AUDIO_CACHE_DIR", tmp_path)
@@ -68,7 +68,7 @@ def test_first_set_opening_does_not_generate_set_audio(tmp_path, monkeypatch):
         exam_type="CET-4",
         year=2025,
         month=6,
-        set_number=1,
+        set_number=2,
         chinese_text="测试",
         topic_cn="测试主题",
     ))
@@ -87,12 +87,13 @@ def test_first_set_opening_does_not_generate_set_audio(tmp_path, monkeypatch):
 
     assert len(captions) == 2
     assert len(captured["part_paths"]) == 2
-    assert all("第一套" not in path for path in captured["part_paths"])
+    assert all("第二套" not in path for path in captured["part_paths"])
+    assert all("第2套" not in chinese for chinese, _ in captions)
     assert captured["gaps_after"] == [OPENING_SENTENCE_GAP_SECONDS, 0.0]
     assert durations == [1.4, 1.0]
 
 
-def test_opening_audio_keeps_both_requested_gaps(tmp_path, monkeypatch):
+def test_later_set_opening_keeps_only_sentence_gap(tmp_path, monkeypatch):
     import app.services.audio_service as audio_module
 
     monkeypatch.setattr(audio_module, "AUDIO_CACHE_DIR", tmp_path)
@@ -118,14 +119,14 @@ def test_opening_audio_keeps_both_requested_gaps(tmp_path, monkeypatch):
 
     _, captions, durations = service.generate_opening_audio(metadata)
 
-    assert captions[1] == ("第2套", "Set 2.")
-    assert len(captured["part_paths"]) == 3
-    assert captured["gaps_after"] == [
-        OPENING_SECTION_SET_GAP_SECONDS,
-        OPENING_SENTENCE_GAP_SECONDS,
-        0.0,
-    ]
-    assert durations == [1.4, 1.4, 1.0]
+    assert len(captions) == 2
+    assert captions[1] == (
+        "你有3秒钟的时间将下面的内容翻译成英文",
+        "You have three seconds to translate the following content into English.",
+    )
+    assert len(captured["part_paths"]) == 2
+    assert captured["gaps_after"] == [OPENING_SENTENCE_GAP_SECONDS, 0.0]
+    assert durations == [1.4, 1.0]
 
 
 def test_identical_tts_text_reuses_stable_disk_cache(tmp_path, monkeypatch):

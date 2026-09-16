@@ -89,9 +89,19 @@ class KeywordsRenderer:
         if main_size is not None:
             english_font = load_english_font(main_size, "bold")
             chinese_font = load_font(main_size, "bold")
-            draw.text((content_x, y + 31), word, font=english_font, fill="#050505")
+            # DIN 英文字体与中文字体的顶部留白不同。若直接共用同一个 y，
+            # 英文的可见字形会比中文高约 6px；按实际字形边界的中心对齐。
+            main_center_y = y + 56
+            english_y = _visual_centered_text_y(draw, word, english_font, main_center_y)
+            chinese_y = _visual_centered_text_y(draw, meaning, chinese_font, main_center_y)
+            draw.text((content_x, english_y), word, font=english_font, fill="#050505")
             word_width = draw.textlength(word + "  ", font=english_font)
-            draw.text((round(content_x + word_width), y + 31), meaning, font=chinese_font, fill="#050505")
+            draw.text(
+                (round(content_x + word_width), chinese_y),
+                meaning,
+                font=chinese_font,
+                fill="#050505",
+            )
             example_y = y + 101
         else:
             english_font = fit_english_font(draw, word, content_width, [34, 32, 30, 28], "bold")
@@ -151,6 +161,12 @@ class KeywordsRenderer:
             if width <= max_width:
                 return size
         return None
+
+
+def _visual_centered_text_y(draw, text: str, font, center_y: float) -> int:
+    """返回使单行文字的实际可见字形垂直居中的 Pillow 绘制坐标。"""
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return round(center_y - (bbox[1] + bbox[3]) / 2)
 
 
 def _highlight_ranges(text: str, key_expression: str) -> list[tuple[int, int]]:

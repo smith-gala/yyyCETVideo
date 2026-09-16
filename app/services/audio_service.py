@@ -13,10 +13,18 @@ from dotenv import load_dotenv
 from app.config import (
     AUDIO_CACHE_DIR, BODY_SENTENCE_GAP_SECONDS, FISH_CET_ZH_REFERENCE_ID,
     FISH_DAILY_EN_REFERENCE_ID, FISH_OPENING_REFERENCE_ID, FISH_REFERENCE_ID,
-    OPENING_SECTION_SET_GAP_SECONDS, OPENING_SENTENCE_GAP_SECONDS, TEMP_DIR
+    OPENING_SENTENCE_GAP_SECONDS, TEMP_DIR
 )
-from app.services.audio_alignment import voiced_bounds
-from app.services.subtitle_service import normalize_bilingual_segments
+from app.services.audio_alignment import (
+    cue_boundaries_from_word_timestamps,
+    english_word_timestamps,
+    voiced_bounds,
+)
+from app.services.subtitle_service import (
+    english_word_count,
+    sentence_units_from_translation_units,
+    split_bilingual_subtitle_cues,
+)
 
 try:
     from moviepy.editor import AudioFileClip, concatenate_audioclips
@@ -48,6 +56,7 @@ class FishAudioService:
         )
         self.opening_reference_id = env_opening_reference_id or FISH_OPENING_REFERENCE_ID
         self.model = os.getenv("FISH_TTS_MODEL", "")
+        self._word_alignment_available = True
 
     def generate_audio(
         self,
@@ -125,27 +134,64 @@ class FishAudioService:
             joined = " ".join(seg.get("english", "") for seg in segments)
             output_path = str(TEMP_DIR / f"english_audio_{abs(hash(joined)) % 100000}.mp3")
 
-        # 每个 cue 对应一个独立 TTS 请求；实际 MP3 时长随后成为该 cue 的时间轴。
-        expanded = normalize_bilingual_segments(segments, max_words=20)
+        # 完整句子才是 TTS 单位；句内短字幕只切换画面，不再切断朗读语流。
+        sentence_units = []
+        for segment in segments:
+            provided_cues = segment.get("subtitle_cues") or []
+            joined_cues = " ".join(
+                " ".join(str(cue.get("english", "")).split())
+                for cue in provided_cues
+                if isinstance(cue, dict)
+            ).strip()
+            sentence_english = " ".join(str(segment.get("english", "")).split()).strip()
+            if provided_cues and joined_cues == sentence_english:
+                sentence_units.append(segment)
+            else:
+                sentence_units.extend(sentence_units_from_translation_units([segment]))
+        if not sentence_units:
+            return None, [], []
 
         if not self.reference_id:
             print("错误: 正文朗读未配置 FISH_REFERENCE_ID")
             return None, [], []
 
         part_paths = []
-        for seg in expanded:
-            generated = self._cached_tts(seg["english"], self.reference_id, "body")
+        for sentence in sentence_units:
+            generated = self._cached_tts(
+                sentence["english"],
+                self.reference_id,
+                "body_sentence_v2",
+            )
             if not generated:
                 return None, [], []
             part_paths.append(generated)
 
         try:
             gaps_after = sentence_gaps_after(
-                [segment["english"] for segment in expanded],
+                [sentence["english"] for sentence in sentence_units],
                 BODY_SENTENCE_GAP_SECONDS,
             )
-            durations = self._combine_audio_parts(part_paths, output_path, gaps_after=gaps_after)
-            return output_path, durations, expanded
+            sentence_durations = self._combine_audio_parts(part_paths, output_path, gaps_after=gaps_after)
+            actual_segments: List[dict] = []
+            durations: List[float] = []
+            for sentence, part_path, sentence_duration, gap in zip(
+                sentence_units,
+                part_paths,
+                sentence_durations,
+                gaps_after,
+            ):
+                cues = sentence.get("subtitle_cues") or split_bilingual_subtitle_cues(
+                    sentence["english"], sentence["chinese"]
+                )
+                cue_durations = self._sentence_cue_durations(
+                    part_path,
+                    cues,
+                    sentence_duration,
+                    gap,
+                )
+                actual_segments.extend(cues)
+                durations.extend(cue_durations)
+            return output_path, durations, actual_segments
         except Exception as e:
             print(f"拼接音频失败: {e}")
             return None, [], []
@@ -157,11 +203,7 @@ class FishAudioService:
 
         captions = opening_captions(metadata)
         spoken_parts = opening_spoken_texts(metadata)
-        gaps_after = (
-            [OPENING_SENTENCE_GAP_SECONDS, 0.0]
-            if metadata.exam_set_number == 1
-            else [OPENING_SECTION_SET_GAP_SECONDS, OPENING_SENTENCE_GAP_SECONDS, 0.0]
-        )
+        gaps_after = [OPENING_SENTENCE_GAP_SECONDS, 0.0]
         spoken_text = (
             "\n".join(spoken_parts)
             + "\n[gaps=" + ",".join(f"{gap:.3f}" for gap in gaps_after) + "]"
@@ -207,6 +249,80 @@ class FishAudioService:
             return str(cache_path)
         cache_dir.mkdir(parents=True, exist_ok=True)
         return self.generate_audio(text, str(cache_path), reference_id=reference_id)
+
+    def _sentence_cue_durations(
+        self,
+        part_path: str,
+        cues: List[dict],
+        sentence_duration: float,
+        gap_after: float,
+    ) -> List[float]:
+        """优先使用词级时间戳；不可用时按词数平滑分配句内字幕时间。"""
+        total_duration = max(0.2, float(sentence_duration))
+        gap = max(0.0, min(float(gap_after), total_duration - 0.1))
+        spoken_duration = max(0.1, total_duration - gap)
+        if len(cues) <= 1:
+            return [total_duration]
+
+        cache_payload = "\n".join(cue["english"] for cue in cues)
+        cache_key = hashlib.sha256(
+            f"sentence-cues-v2\n{Path(part_path).stem}\n{cache_payload}".encode("utf-8")
+        ).hexdigest()[:24]
+        cache_path = AUDIO_CACHE_DIR / "body_alignment_v2" / f"{cache_key}.json"
+        cached = self._read_cached_durations(cache_path, len(cues))
+        if cached and abs(sum(cached) - total_duration) <= 0.05:
+            return cached
+
+        boundaries: List[float] = []
+        if self._word_alignment_available:
+            try:
+                source = AudioFileClip(part_path)
+                try:
+                    speech_start, _ = voiced_bounds(part_path, float(source.duration))
+                finally:
+                    source.close()
+                raw_words = english_word_timestamps(part_path, cache_payload)
+                adjusted_words = [
+                    (
+                        max(0.0, start - speech_start),
+                        min(spoken_duration, max(0.0, end - speech_start)),
+                        word,
+                    )
+                    for start, end, word in raw_words
+                    if end > speech_start and start - speech_start < spoken_duration
+                ]
+                boundaries = cue_boundaries_from_word_timestamps(
+                    [cue["english"] for cue in cues],
+                    adjusted_words,
+                    spoken_duration,
+                )
+            except Exception as exc:
+                self._word_alignment_available = False
+                print(f"词级字幕对齐不可用，改用朗读权重时间轴: {exc}")
+
+        if not boundaries:
+            weights = [max(1, english_word_count(cue["english"])) for cue in cues]
+            total_weight = max(1, sum(weights))
+            cursor = 0
+            for weight in weights[:-1]:
+                cursor += weight
+                boundaries.append(spoken_duration * cursor / total_weight)
+
+        points = [0.0, *boundaries, spoken_duration]
+        durations = [
+            max(0.05, points[index + 1] - points[index])
+            for index in range(len(cues))
+        ]
+        durations[-1] += gap
+        durations[-1] += total_duration - sum(durations)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = cache_path.with_suffix(".tmp")
+        temp_path.write_text(
+            json.dumps({"durations": durations}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp_path.replace(cache_path)
+        return durations
 
     def _cache_key(self, text: str, reference_id: str) -> str:
         payload = json.dumps(
@@ -328,7 +444,7 @@ class FishAudioService:
 
 
 def opening_captions(metadata: Any) -> List[Tuple[str, str]]:
-    """构造与试卷元数据一致的动态中英文开场字幕。第一套只在题板中显示。"""
+    """构造动态中英文开场字幕；套数只在题板中显示。"""
     month_en = {6: "June", 12: "December"}.get(metadata.exam_month, str(metadata.exam_month))
     band = "4" if metadata.exam_level == "CET-4" else "6"
     captions = [
@@ -337,37 +453,22 @@ def opening_captions(metadata: Any) -> List[Tuple[str, str]]:
             f"This is the translation section of the {month_en} {metadata.exam_year} College English Test Band {band}.",
         ),
         (
-            f"第{metadata.exam_set_number}套",
-            f"Set {metadata.exam_set_number}.",
-        ),
-        (
             "你有3秒钟的时间将下面的内容翻译成英文",
             "You have three seconds to translate the following content into English.",
         ),
     ]
-    if metadata.exam_set_number == 1:
-        del captions[1]
     return captions
 
 
 def opening_spoken_texts(metadata: Any) -> List[str]:
-    """用中文数字明确读出“年/月”；第一套的套数只在题板中显示，不朗读。"""
+    """用中文数字明确读出“年/月”；套数只在题板中显示，不朗读。"""
     digits = "零一二三四五六七八九"
     year = "".join(digits[int(char)] for char in str(metadata.exam_year))
     month = {6: "六月", 12: "十二月"}.get(metadata.exam_month, f"{metadata.exam_month}月")
-    set_number = {
-        1: "一",
-        2: "二",
-        3: "三",
-    }.get(metadata.exam_set_number, str(metadata.exam_set_number))
-    spoken = [
+    return [
         f"这是{year}年{month}，全国大学生英语{metadata.exam_level_cn}考试翻译部分。",
-        f"第{set_number}套",
         "你有3秒钟的时间将下面的内容翻译成英文",
     ]
-    if metadata.exam_set_number == 1:
-        del spoken[1]
-    return spoken
 
 
 def sentence_gaps_after(texts: List[str], gap_seconds: float) -> List[float]:

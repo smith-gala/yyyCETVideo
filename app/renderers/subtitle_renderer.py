@@ -12,7 +12,14 @@ from app.renderers.layout_utils import draw_centered, load_background, load_font
 class SubtitleRenderer:
     """生成固定字号、透明背景且按安全区自然换行的双语字幕。"""
 
-    def render_card(self, english: str, chinese: str, chinese_top: bool = False) -> Image.Image:
+    def render_card(
+        self,
+        english: str,
+        chinese: str,
+        chinese_top: bool = False,
+        max_english_lines: Optional[int] = None,
+        max_chinese_lines: Optional[int] = None,
+    ) -> Image.Image:
         dummy = Image.new("RGBA", (SUBTITLE.width, 600), (0, 0, 0, 0))
         measure = ImageDraw.Draw(dummy)
         en_font = load_font(SUBTITLE.english_font_size, "bold")
@@ -21,6 +28,10 @@ class SubtitleRenderer:
         # 贪心换行会先尽量占满第一行；短句保持一行，长句可自然增加行数。
         en_lines = wrap_text(measure, english.strip(), en_font, max_width, prefer_words=True)
         zh_lines = wrap_text(measure, chinese.strip(), zh_font, max_width, prefer_words=False)
+        if max_english_lines is not None and len(en_lines) > max_english_lines:
+            raise ValueError(f"英文字幕超过{max_english_lines}行，请重新切分: {english}")
+        if max_chinese_lines is not None and len(zh_lines) > max_chinese_lines:
+            raise ValueError(f"中文字幕超过{max_chinese_lines}行，请重新切分: {chinese}")
 
         first_lines, second_lines = (zh_lines, en_lines) if chinese_top else (en_lines, zh_lines)
         first_font, second_font = (zh_font, en_font) if chinese_top else (en_font, zh_font)

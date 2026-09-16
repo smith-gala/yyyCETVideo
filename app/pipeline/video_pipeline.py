@@ -181,7 +181,7 @@ class VideoPipeline:
             chinese_top=True,
             y_offset=-50,
         )
-        clip = CompositeVideoClip(layers, size=self.size, bg_color=(0, 0, 0))
+        clip = self._compose_layers(layers)
         # 倒计时和考试结束页必须复用无字幕题板，不能截取 t=0 的合成帧。
         clean_question_frame = np.array(Image.open(img_path).convert("RGB"))
         return (self._with_audio(clip, audio), clean_question_frame)
@@ -199,7 +199,7 @@ class VideoPipeline:
                 )
             )
 
-        clip = CompositeVideoClip(layers, size=self.size, bg_color=(0, 0, 0))
+        clip = self._compose_layers(layers)
         audio = self._audio_or_none(ASSET_COUNTDOWN_SFX)
         return self._with_audio(clip, audio) if audio else clip
 
@@ -219,7 +219,7 @@ class VideoPipeline:
             chinese_top=True,
             recognize_fixed_audio=True,
         )
-        return self._with_audio(CompositeVideoClip(layers, size=self.size, bg_color=(0, 0, 0)), audio)
+        return self._with_audio(self._compose_layers(layers), audio)
 
     def _create_content_clip(self, config: VideoConfig):
         if not config.audio_path or not os.path.exists(config.audio_path):
@@ -247,8 +247,9 @@ class VideoPipeline:
             segments,
             duration,
             orientation=config.background_orientation,
+            strict_lines=True,
         )
-        return self._with_audio(CompositeVideoClip(layers, size=self.size, bg_color=(0, 0, 0)), audio)
+        return self._with_audio(self._compose_layers(layers), audio)
 
     def _create_keywords_clip(self, config: VideoConfig, metadata: ExamMetadata):
         img_path = str(TEMP_DIR / f"keywords_{config.paper.paper_id}.png")
@@ -280,7 +281,7 @@ class VideoPipeline:
                 minimum_y=KEYWORDS.outer[3] + 30,
                 recognize_fixed_audio=True,
             )
-        clip = CompositeVideoClip(layers, size=self.size, bg_color=(0, 0, 0))
+        clip = self._compose_layers(layers)
         audio_layers = []
         if chime_audio:
             audio_layers.append(chime_audio)
@@ -510,7 +511,9 @@ class VideoPipeline:
     def _is_sentence_boundary(self, boundary: float, segments: List[SubtitleSegment]) -> bool:
         for segment in segments:
             if abs(segment.end - boundary) < 0.001:
-                return segment.english.strip().endswith(SENTENCE_ENDINGS) or segment.chinese.strip().endswith(SENTENCE_ENDINGS)
+                english = segment.english.strip()
+                chinese = segment.chinese.strip()
+                return bool(re.search(r"[.!?][\"'”’\)\]]*$", english)) or chinese.endswith(SENTENCE_ENDINGS)
         return False
 
     def _text_for_range(self, start: float, end: float, segments: List[SubtitleSegment]) -> str:
@@ -549,6 +552,7 @@ class VideoPipeline:
         chinese_top: bool = False,
         y_offset: int = 0,
         minimum_y: Optional[int] = None,
+        strict_lines: bool = False,
     ):
         layers = []
         if not segments:
@@ -558,7 +562,13 @@ class VideoPipeline:
             end = min(duration, seg.end or duration)
             if end <= start:
                 continue
-            image = self.subtitle_renderer.render_card(seg.english, seg.chinese, chinese_top=chinese_top)
+            image = self.subtitle_renderer.render_card(
+                seg.english,
+                seg.chinese,
+                chinese_top=chinese_top,
+                max_english_lines=2 if strict_lines else None,
+                max_chinese_lines=2 if strict_lines else None,
+            )
             card_y = self._subtitle_position(
                 image.height,
                 orientation,
@@ -680,3 +690,11 @@ class VideoPipeline:
 
     def _with_start(self, clip, start: float):
         return clip.with_start(start) if hasattr(clip, "with_start") else clip.set_start(start)
+
+    def _compose_layers(self, layers):
+        """以首层作为不透明背景，避免每帧重复创建并合成全画幅画布。"""
+        if not layers:
+            raise ValueError("视频合成至少需要一个图层")
+        if len(layers) == 1:
+            return layers[0]
+        return CompositeVideoClip(layers, size=self.size, use_bgclip=True)

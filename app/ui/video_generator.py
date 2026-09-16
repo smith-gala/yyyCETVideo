@@ -11,8 +11,13 @@ from app.config import (
     ASSET_CLOSING_AUDIO, ASSET_COVER_BG, ASSET_ENDING_EXAM_AUDIO,
     ASSET_KEYWORDS_BG, BACKGROUNDS_DIR, OUTPUT_DIR, TEMP_DIR,
 )
-from app.models import ExamMetadata, ExamPaper, KeyExpression, PexelsAsset, VideoConfig
-from app.services.subtitle_service import english_word_count, normalize_source_text, realign_bilingual_segments
+from app.models import ExamMetadata, ExamPaper, KeyExpression, PexelsAsset, TranslationUnit, VideoConfig
+from app.services.subtitle_service import (
+    SUBTITLE_PIPELINE_VERSION,
+    normalize_source_text,
+    prepare_translation_units,
+    subtitle_display_chinese,
+)
 
 
 def render_video_generator():
@@ -71,6 +76,10 @@ def render_video_generator():
                         count=5
                     )
                 selected_paper.key_expressions = generated_expressions
+                selected_paper.translation_units = [
+                    TranslationUnit.model_validate(item)
+                    for item in result.get("segments", [])
+                ]
                 pdf_service.save_paper(selected_paper)
                 _bump_key_expression_version(selected_paper.paper_id)
                 st.success("分析完成。")
@@ -145,37 +154,61 @@ def render_video_generator():
     else:
         st.warning("当前没有读取到 Fish Reference ID，请检查 .env 中的 FISH_REFERENCE_ID。")
 
-    raw_segments = realign_bilingual_segments(
+    raw_segments = prepare_translation_units(
         chinese_text,
+        english_text,
         _subtitle_source_segments(analysis, selected_paper, chinese_text, english_text),
     )
-    if st.button("生成/重新生成英文朗读", use_container_width=True, disabled=not english_text.strip()):
-        audio_service = _get_audio_service(refresh=True)
-        st.session_state.pop(f"audio_{selected_paper.paper_id}", None)
-        with st.spinner("正在按字幕 cue 合成 Fish Audio，并按真实时长拼接音频..."):
-            output = str(TEMP_DIR / f"english_audio_{selected_paper.paper_id}.wav")
-            audio_path, durations, actual_segments = audio_service.generate_segmented_audio(raw_segments, output_path=output)
-        if audio_path:
-            subtitles = _build_subtitle_timeline(actual_segments, durations)
-            selected_paper.subtitle_segments = subtitles
-            selected_paper.english_text = english_text.strip()
-            selected_paper.topic_cn = topic_cn.strip()
-            selected_paper.topic_keyword = topic_keyword.strip()
-            selected_paper.publish_topic = publish_topic.strip()
-            pdf_service.save_paper(selected_paper)
-            st.session_state[f"audio_{selected_paper.paper_id}"] = audio_path
-            st.success("英文朗读音频已生成。")
+    if st.button("AI对齐字幕并生成/重新生成英文朗读", use_container_width=True, disabled=not english_text.strip()):
+        ai_service = _get_ai_service()
+        with st.spinner("正在让模型按固定英文短句对齐中文原文..."):
+            aligned_segments = ai_service.align_subtitle_cues(raw_segments)
+        if not aligned_segments:
+            st.error("AI字幕语义对齐失败，已停止生成。若原文和译文未修改，原有字幕和音频仍可继续使用。")
         else:
-            st.error("音频生成失败，请检查 FISH_API_KEY，以及 FISH_REFERENCE_ID / FISH_CET_ZH_REFERENCE_ID / FISH_DAILY_EN_REFERENCE_ID。")
+            audio_service = _get_audio_service(refresh=True)
+            with st.spinner("正在按完整句子合成连续 Fish Audio，并按词级时间戳生成字幕时间轴..."):
+                output = str(TEMP_DIR / f"english_audio_{selected_paper.paper_id}.wav")
+                audio_path, durations, actual_segments = audio_service.generate_segmented_audio(
+                    aligned_segments,
+                    output_path=output,
+                )
+            if audio_path:
+                subtitles = _build_subtitle_timeline(actual_segments, durations)
+                selected_paper.subtitle_segments = subtitles
+                selected_paper.subtitle_pipeline_version = SUBTITLE_PIPELINE_VERSION
+                selected_paper.translation_units = [
+                    TranslationUnit.model_validate(item) for item in raw_segments
+                ]
+                selected_paper.english_text = english_text.strip()
+                selected_paper.topic_cn = topic_cn.strip()
+                selected_paper.topic_keyword = topic_keyword.strip()
+                selected_paper.publish_topic = publish_topic.strip()
+                pdf_service.save_paper(selected_paper)
+                st.session_state[f"audio_{selected_paper.paper_id}"] = audio_path
+                st.success("英文朗读音频和 AI 语义对齐字幕已生成。")
+            else:
+                st.error("音频生成失败，请检查 FISH_API_KEY，以及 FISH_REFERENCE_ID / FISH_CET_ZH_REFERENCE_ID / FISH_DAILY_EN_REFERENCE_ID。")
 
-    audio_path = st.session_state.get(f"audio_{selected_paper.paper_id}")
-    if audio_path and any(english_word_count(segment.english) > 20 for segment in (selected_paper.subtitle_segments or [])):
-        st.warning("检测到旧版长字幕时间轴。为避免字幕丢失，请点击上方按钮重新生成分段朗读。")
-        audio_path = None
-    if audio_path and os.path.exists(audio_path):
+    audio_state_key = f"audio_{selected_paper.paper_id}"
+    audio_path = _resolve_existing_body_audio(
+        selected_paper,
+        chinese_text,
+        english_text,
+        st.session_state.get(audio_state_key),
+        TEMP_DIR / f"english_audio_{selected_paper.paper_id}.wav",
+    )
+    if audio_path:
+        # Streamlit 刷新或一次 LLM 对齐失败后，恢复可预测路径下的旧音频。
+        st.session_state[audio_state_key] = audio_path
+    else:
+        st.session_state.pop(audio_state_key, None)
+    if selected_paper.subtitle_pipeline_version < SUBTITLE_PIPELINE_VERSION:
+        st.warning("检测到旧版字幕时间轴。请点击上方按钮重新生成 AI 语义对齐字幕和连续句子朗读。")
+    if audio_path:
         st.audio(audio_path)
     elif selected_paper.subtitle_segments:
-        st.info("已有字幕时间轴，但当前会话未记录音频路径。如需生成视频，请重新生成英文朗读。")
+        st.info("已有字幕时间轴，但未找到与当前原文和译文匹配的英文朗读文件。请重新生成。")
 
     st.markdown("---")
     st.subheader("4. 封面")
@@ -269,7 +302,7 @@ def render_video_generator():
 
     st.info(
         "动态开场使用 TTS 文案直接生成字幕和时间轴；更换 FISH_OPENING_REFERENCE_ID 或模型后，"
-        "缓存键会变化并自动重建，不需要再做语音识别。第一套的套数只保留在题板图片中。"
+        "缓存键会变化并自动重建，不需要再做语音识别。套数只保留在题板图片中。"
     )
 
     st.markdown("---")
@@ -404,6 +437,37 @@ def _build_subtitle_timeline(segments: list[dict], durations: list[float]) -> li
     return timeline
 
 
+def _resolve_existing_body_audio(
+    paper: ExamPaper,
+    chinese_text: str,
+    english_text: str,
+    *candidate_paths: str | Path | None,
+) -> str | None:
+    """只恢复与当前正文及新版字幕严格匹配的现有音频。"""
+    if (
+        paper.subtitle_pipeline_version < SUBTITLE_PIPELINE_VERSION
+        or not paper.subtitle_segments
+    ):
+        return None
+
+    joined_english = " ".join(
+        " ".join(segment.english.split())
+        for segment in paper.subtitle_segments
+    ).strip()
+    joined_chinese = normalize_source_text(
+        "".join(segment.chinese for segment in paper.subtitle_segments)
+    )
+    current_english = " ".join(str(english_text or "").split()).strip()
+    current_chinese = subtitle_display_chinese(chinese_text)
+    if joined_english != current_english or joined_chinese != current_chinese:
+        return None
+
+    for candidate in candidate_paths:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    return None
+
+
 def _select_paper(cached_papers):
     options = [paper.display_name for paper in cached_papers]
     index = st.selectbox("选择真题", range(len(options)), format_func=lambda i: options[i])
@@ -435,6 +499,11 @@ def _subtitle_source_segments(analysis: dict, paper, chinese_text: str, english_
     """优先复用与当前译文一致的语义分段，避免刷新后重新按长度错切。"""
     current_english = " ".join(english_text.split())
     candidates = []
+    if paper.translation_units:
+        candidates.append([
+            {"chinese": unit.chinese, "english": unit.english}
+            for unit in paper.translation_units
+        ])
     if analysis.get("segments"):
         candidates.append(analysis["segments"])
     if paper.subtitle_segments:
